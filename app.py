@@ -1,203 +1,195 @@
 import gradio as gr
-import sqlite3
-import json
+import modal
+import io
+import sys
 import os
-from datetime import datetime, timedelta
+import sqlite3
+import concurrent.futures
+import soundfile as sf
+import numpy as np
+from PIL import Image as PILImage
 
-DB_PATH = "db/pantry.db"
+sys.path.append(os.path.dirname(__file__))
+from utils import (
+    estimate_expiry, format_parsed_items,
+    save_to_db, expiry_status, init_db
+)
 
-def init_db():
-    os.makedirs("db", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS pantry (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        item_name TEXT,
-        quantity TEXT,
-        purchase_date TEXT,
-        estimated_expiry TEXT,
-        category TEXT,
-        used INTEGER DEFAULT 0
-    )''')
-    conn.commit()
-    conn.close()
-
-SHELF_LIFE = {
-    "spinach": 5, "baby spinach": 5, "tomatoes": 7, "cherry tomatoes": 7,
-    "yoghurt": 14, "greek yoghurt": 14, "milk": 7, "eggs": 21,
-    "chicken": 2, "basmati rice": 180, "rice": 180, "lentils": 365,
-    "coconut milk": 365, "butter": 30, "cheese": 21, "bread": 7,
-    "onion": 30, "garlic": 60, "potato": 30, "carrot": 21,
-    "cucumber": 7, "pepper": 7, "courgette": 7, "mushroom": 5,
-}
-
-def estimate_expiry(item_name):
-    name_lower = item_name.lower()
-    for key, days in SHELF_LIFE.items():
-        if key in name_lower:
-            expiry = datetime.now() + timedelta(days=days)
-            return expiry.strftime("%Y-%m-%d")
-    expiry = datetime.now() + timedelta(days=7)
-    return expiry.strftime("%Y-%m-%d")
-
-def expiry_status(expiry_str):
-    try:
-        expiry = datetime.strptime(expiry_str, "%Y-%m-%d")
-        days_left = (expiry - datetime.now()).days
-        if days_left <= 1:
-            return "🔴", days_left
-        elif days_left <= 5:
-            return "🟡", days_left
-        else:
-            return "🟢", days_left
-    except:
-        return "🟢", 999
-
-DUMMY_ITEMS = [
-    {"name": "Baby spinach 200g", "qty": "1", "expiry": (datetime.now() + timedelta(days=0)).strftime("%Y-%m-%d")},
-    {"name": "Cherry tomatoes 400g", "qty": "1", "expiry": (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d")},
-    {"name": "Greek yoghurt 500g", "qty": "1", "expiry": (datetime.now() + timedelta(days=5)).strftime("%Y-%m-%d")},
-    {"name": "Basmati rice 1kg", "qty": "1", "expiry": (datetime.now() + timedelta(days=180)).strftime("%Y-%m-%d")},
-    {"name": "Coconut milk 400ml", "qty": "2", "expiry": (datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d")},
-]
+os.makedirs("/data", exist_ok=True)
+DB_PATH = "/data/pantry.db"
 
 CHARACTERS = {
-    "Grandma (Paati)": "You are Paati, a warm but judgemental South Indian grandma. You speak in a mix of English with occasional Tamil words. You scold gently about food waste, express love through feeding people, and always know the best traditional recipe for any ingredient.",
-    "Chef": "You are a sharp, no-nonsense professional chef. You are direct, technically precise, slightly impatient with bad ingredients, but brilliant at making something out of nothing.",
-    "Fitness Coach": "You are an enthusiastic fitness coach. Every recipe must be high protein, low waste, macro-balanced. You relate everything back to gains, recovery, and clean eating.",
-    "Food Critic": "You are a pompous but secretly warm food critic. You critique the ingredients dramatically before reluctantly producing a brilliant recipe.",
+    "Grandma (Ammamma)": "Warm loving grandma who hates food waste.",
+    "Chef": "Sharp professional chef. Direct and brilliant.",
+    "Fitness Coach": "Enthusiastic fitness coach obsessed with gains.",
+    "Food Critic": "Pompous but secretly warm food critic.",
 }
 
 CUISINES = ["South Indian", "North Indian", "Italian", "Mediterranean", "East Asian", "Surprise me"]
 
-def parse_receipt(image):
-    if image is None:
-        return format_parsed_items(DUMMY_ITEMS), DUMMY_ITEMS
-    return format_parsed_items(DUMMY_ITEMS), DUMMY_ITEMS
+# TTS backend: True = VoxCPMService class (OpenBMB VoxCPM2, full-recipe narration)
+# False = legacy "text_to_speech" function (Coqui XTTS-v2, dialogue only)
+USE_VOXCPM = True
 
-def format_parsed_items(items):
-    lines = []
-    for item in items:
-        emoji, days = expiry_status(item["expiry"])
-        if days <= 1:
-            label = "expires today"
-        elif days <= 5:
-            label = f"expires in {days} days"
-        else:
-            label = f"expires in {days} days"
-        lines.append(f"{emoji} {item['name']} (qty: {item['qty']}) — {label}")
-    return "\n".join(lines)
+CHAR_EMOJI = {
+    "Grandma (Ammamma)": "🧓",
+    "Chef": "👨‍🍳",
+    "Fitness Coach": "💪",
+    "Food Critic": "⭐"
+}
 
-def save_to_pantry(items_state):
-    init_db()
+
+def get_pantry_display():
+    init_db(DB_PATH)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    for item in items_state:
-        c.execute('''INSERT INTO pantry (item_name, quantity, purchase_date, estimated_expiry, category)
-                     VALUES (?, ?, ?, ?, ?)''',
-                  (item["name"], item["qty"], datetime.now().strftime("%Y-%m-%d"),
-                   item["expiry"], "general"))
-    conn.commit()
-    conn.close()
-    return "Saved to pantry"
-
-def get_pantry():
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, item_name, quantity, estimated_expiry FROM pantry WHERE used=0 ORDER BY estimated_expiry ASC")
+    c.execute("SELECT item_name, quantity, estimated_expiry FROM pantry WHERE used=0 ORDER BY estimated_expiry ASC")
     rows = c.fetchall()
     conn.close()
     if not rows:
         return "Your pantry is empty — scan a receipt to get started."
-    lines = []
-    expiring_today = 0
-    for row in rows:
-        emoji, days = expiry_status(row[3])
-        if days <= 1:
-            expiring_today += 1
-            label = "TODAY"
-        elif days <= 5:
-            label = f"{days} days"
-        else:
-            label = f"{days} days"
-        lines.append(f"{emoji} {row[1]} (x{row[2]}) — {label}")
-    header = ""
-    if expiring_today > 0:
-        header = f"🚨 {expiring_today} item(s) expiring today — cook them now!\n\n"
-    return header + "\n".join(lines)
 
-def mark_used(item_name):
-    init_db()
+    red = [r for r in rows if expiry_status(r[2])[1] <= 1]
+    amber = [r for r in rows if 1 < expiry_status(r[2])[1] <= 5]
+    green = [r for r in rows if expiry_status(r[2])[1] > 5]
+
+    lines = []
+    lines.append(f"📦 {len(rows)} items in pantry")
+    lines.append(f"🔴 {len(red)} expiring today  🟡 {len(amber)} expiring soon  🟢 {len(green)} fine")
+    lines.append("─" * 40)
+
+    if red:
+        lines.append("\n🔴 COOK TODAY:")
+        for r in red:
+            lines.append(f"  • {r[0]} (x{r[1]})")
+
+    if amber:
+        lines.append("\n🟡 USE THIS WEEK:")
+        for r in amber:
+            _, days = expiry_status(r[2])
+            lines.append(f"  • {r[0]} (x{r[1]}) — {days} days left")
+
+    if green:
+        lines.append("\n🟢 ALL GOOD:")
+        for r in green:
+            _, days = expiry_status(r[2])
+            lines.append(f"  • {r[0]} (x{r[1]}) — {days} days")
+
+    return "\n".join(lines)
+
+
+def mark_used_local(item_name):
+    init_db(DB_PATH)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("UPDATE pantry SET used=1 WHERE item_name=? AND used=0", (item_name,))
+    rows_affected = c.rowcount
     conn.commit()
     conn.close()
-    return get_pantry()
+    return get_pantry_display()
 
-def generate_recipe(character, cuisine, use_expiring):
-    expiring = [i for i in DUMMY_ITEMS if expiry_status(i["expiry"])[1] <= 5]
-    all_items = DUMMY_ITEMS
-    items_to_use = expiring if use_expiring and expiring else all_items
 
-    char_voice = {
-        "Grandma (Paati)": "🧓 Paati says:\n\"Ayo! That spinach is dying and you haven't touched it? Shame on you! Come, I'll show you a proper keerai kootu.\"\n\n",
-        "Chef": "👨‍🍳 Chef says:\n\"Right. You've got spinach on its last legs and some tomatoes. We're making something. Pay attention.\"\n\n",
-        "Fitness Coach": "💪 Coach says:\n\"Perfect! Spinach is iron-rich, tomatoes are antioxidants. We're making a macro-friendly power bowl. Let's GO.\"\n\n",
-        "Food Critic": "⭐ Critic says:\n\"These ingredients are... humble. And yet. With sufficient technique, even the wilting spinach can achieve greatness.\"\n\n",
-    }
+def parse_receipt_gradio(image):
+    if image is None:
+        return "Please upload a receipt image.", [], ""
+    try:
+        img_bytes = io.BytesIO()
+        if not isinstance(image, PILImage.Image):
+            image = PILImage.fromarray(image)
+        image.save(img_bytes, format="JPEG")
+        img_bytes = img_bytes.getvalue()
 
-    cuisine_recipes = {
-        "South Indian": {
-            "name": "Keerai kootu with coconut dal",
-            "ingredients": ["Baby spinach", "Cherry tomatoes", "Coconut milk", "Basmati rice", "Mustard seeds", "Curry leaves", "Turmeric"],
-            "steps": [
-                "Blanch spinach for 2 mins, drain and roughly chop.",
-                "Heat oil, temper mustard seeds and curry leaves.",
-                "Add tomatoes, cook till soft — about 5 mins.",
-                "Add coconut milk and turmeric, simmer 3 mins.",
-                "Fold in spinach, season with salt.",
-                "Serve over steamed basmati rice."
-            ]
-        },
-        "Italian": {
-            "name": "Spinach and tomato pasta",
-            "ingredients": ["Baby spinach", "Cherry tomatoes", "Garlic", "Olive oil", "Pasta", "Parmesan"],
-            "steps": [
-                "Cook pasta al dente, reserve 1 cup pasta water.",
-                "Sauté garlic in olive oil until golden.",
-                "Add tomatoes, cook until they burst — 4 mins.",
-                "Wilt spinach in the pan — 1 min.",
-                "Toss pasta with vegetables and pasta water.",
-                "Finish with parmesan and black pepper."
-            ]
-        },
-    }
+        parse_fn = modal.Function.from_name("zerowastekitchen", "parse_receipt")
+        result = parse_fn.remote(img_bytes)
 
-    recipe = cuisine_recipes.get(cuisine, cuisine_recipes["South Indian"])
-    voice = char_voice.get(character, char_voice["Grandma (Paati)"])
+        nemotron_cls = modal.Cls.from_name("zerowastekitchen", "NemotronService")
+        item_names = [i["name"] for i in result.get("items", [])]
+        expiry_map = nemotron_cls().estimate_expiry.remote(item_names)
 
-    expiring_tags = [f"⚠️ {i['name']}" for i in items_to_use if expiry_status(i["expiry"])[1] <= 3]
+        for item in result.get("items", []):
+            item["expiry"] = expiry_map.get(
+                item["name"],
+                estimate_expiry(item["name"])
+            )
 
-    output = voice
-    output += f"🍽️ Recipe: {recipe['name']}\n"
-    output += f"Cuisine: {cuisine}\n\n"
-    if expiring_tags:
-        output += f"Using before they go: {', '.join(expiring_tags)}\n\n"
-    output += "Ingredients:\n"
-    for ing in recipe["ingredients"]:
-        output += f"  • {ing}\n"
-    output += "\nSteps:\n"
-    for i, step in enumerate(recipe["steps"], 1):
-        output += f"  {i}. {step}\n"
-    output += "\n[🔊 Bark TTS voice coming soon]"
-    return output
+        save_to_db(result["items"], result.get("shop", "unknown"), DB_PATH)
 
-init_db()
+        n = len(result["items"])
+        shop = result.get("shop", "unknown")
+        status = f"✅ {n} item{'s' if n != 1 else ''} saved to pantry (from {shop})"
+        return format_parsed_items(result["items"]), result["items"], status
+
+    except Exception as e:
+        return f"Error: {str(e)}", [], "❌ Nothing saved — see error above"
+
+
+def generate_recipe_with_audio(character, cuisine, use_expiring, read_full_recipe):
+    try:
+        init_db(DB_PATH)
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "SELECT item_name, quantity, estimated_expiry FROM pantry WHERE used=0 ORDER BY estimated_expiry ASC"
+        )
+        rows = c.fetchall()
+        conn.close()
+
+        if not rows:
+            return "Your pantry is empty — scan a receipt first.", None
+
+        all_items = [{"name": r[0], "quantity": r[1], "expiry": r[2]} for r in rows]
+
+        for item in all_items:
+            _, days = expiry_status(item["expiry"])
+            item["days_left"] = days
+
+        if use_expiring:
+            featured = [i for i in all_items if i["days_left"] <= 5]
+            if not featured:
+                featured = all_items[:1]
+        else:
+            # Checkbox off: feature a varied selection from the whole pantry
+            import random
+            featured = random.sample(all_items, min(3, len(all_items)))
+
+        expiring = featured
+        expiring_names = [i["name"] for i in featured]
+
+        dialogue_fn = modal.Function.from_name("zerowastekitchen", "generate_dialogue")
+        recipe_fn = modal.Cls.from_name("zerowastekitchen", "NemotronService")().generate_recipe
+        if USE_VOXCPM:
+            tts_fn = modal.Cls.from_name("zerowastekitchen", "VoxCPMService")().narrate
+        else:
+            tts_fn = modal.Function.from_name("zerowastekitchen", "text_to_speech")
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            dialogue_future = executor.submit(
+                dialogue_fn.remote, character, expiring_names[:5], cuisine
+            )
+            recipe_future = executor.submit(
+                recipe_fn.remote, all_items, expiring, cuisine
+            )
+            dialogue = dialogue_future.result()
+            recipe = recipe_future.result()
+
+        speech_text = f"{dialogue}\n{recipe}" if read_full_recipe else dialogue
+        audio_bytes = tts_fn.remote(speech_text, character)
+
+        emoji = CHAR_EMOJI.get(character, "🧓")
+        output = f"{emoji} {character} says:\n\"{dialogue}\"\n\n"
+        output += recipe
+
+        buf = io.BytesIO(audio_bytes)
+        audio_np, sr = sf.read(buf)
+
+        return output, (sr, audio_np)
+
+    except Exception as e:
+        return f"Error: {str(e)}", None
+
 
 with gr.Blocks(title="ZeroWasteKitchen", theme=gr.themes.Soft()) as app:
-    items_state = gr.State(DUMMY_ITEMS)
+    items_state = gr.State([])
 
     gr.Markdown("# 🌿 ZeroWasteKitchen\n*Scan receipts · track expiry · cook with personality*")
 
@@ -205,31 +197,56 @@ with gr.Blocks(title="ZeroWasteKitchen", theme=gr.themes.Soft()) as app:
 
         with gr.Tab("1 · Upload receipt"):
             gr.Markdown("### Upload your grocery receipt")
-            receipt_image = gr.Image(label="Receipt photo", type="pil", sources=["upload", "webcam"])
+            receipt_image = gr.Image(
+                label="Receipt photo",
+                type="pil",
+                sources=["upload", "webcam"]
+            )
             parse_btn = gr.Button("Parse receipt", variant="primary")
-            parsed_output = gr.Textbox(label="Parsed items", lines=8, interactive=False)
-            save_btn = gr.Button("Save to pantry →")
-            save_status = gr.Textbox(label="", interactive=False, max_lines=1)
-
-            parse_btn.click(fn=parse_receipt, inputs=[receipt_image], outputs=[parsed_output, items_state])
-            save_btn.click(fn=lambda s: save_to_pantry(s), inputs=[items_state], outputs=[save_status])
+            parsed_output = gr.Textbox(
+                label="Parsed items",
+                lines=10,
+                interactive=False
+            )
+            save_status = gr.Textbox(
+                label="",
+                interactive=False,
+                max_lines=1
+            )
+            parse_btn.click(
+                fn=parse_receipt_gradio,
+                inputs=[receipt_image],
+                outputs=[parsed_output, items_state, save_status]
+            )
 
         with gr.Tab("2 · My pantry"):
             gr.Markdown("### Your current pantry")
             refresh_btn = gr.Button("Refresh", size="sm")
-            pantry_output = gr.Textbox(label="Pantry status", lines=12, interactive=False, value=get_pantry())
+            pantry_output = gr.Textbox(
+                label="Pantry status",
+                lines=15,
+                interactive=False,
+                value="Click Refresh to load pantry"
+            )
             with gr.Row():
-                mark_item = gr.Textbox(label="Item name to mark as used", placeholder="e.g. Baby spinach 200g")
+                mark_item = gr.Textbox(
+                    label="Item name to mark as used",
+                    placeholder="e.g. CURRIS LEAVES PACKET"
+                )
                 mark_btn = gr.Button("Mark as used", size="sm")
-            refresh_btn.click(fn=get_pantry, outputs=[pantry_output])
-            mark_btn.click(fn=mark_used, inputs=[mark_item], outputs=[pantry_output])
+            refresh_btn.click(fn=get_pantry_display, outputs=[pantry_output])
+            mark_btn.click(
+                fn=mark_used_local,
+                inputs=[mark_item],
+                outputs=[pantry_output]
+            )
 
         with gr.Tab("3 · Cook"):
             gr.Markdown("### Pick your character and cuisine")
             with gr.Row():
                 character = gr.Dropdown(
                     choices=list(CHARACTERS.keys()),
-                    value="Grandma (Paati)",
+                    value="Grandma (Ammamma)",
                     label="Character"
                 )
                 cuisine = gr.Dropdown(
@@ -237,10 +254,35 @@ with gr.Blocks(title="ZeroWasteKitchen", theme=gr.themes.Soft()) as app:
                     value="South Indian",
                     label="Cuisine"
                 )
-            use_expiring = gr.Checkbox(label="Prioritise expiring items", value=True)
-            cook_btn = gr.Button("Cook with what I have", variant="primary")
-            recipe_output = gr.Textbox(label="Your recipe", lines=20, interactive=False)
-            cook_btn.click(fn=generate_recipe, inputs=[character, cuisine, use_expiring], outputs=[recipe_output])
+            use_expiring = gr.Checkbox(
+                label="Prioritise expiring items",
+                value=True
+            )
+            read_full_recipe = gr.Checkbox(
+                label="🔊 Read the full recipe aloud (takes longer)",
+                value=True
+            )
+            cook_btn = gr.Button(
+                "Cook with what I have",
+                variant="primary"
+            )
+            recipe_output = gr.Textbox(
+                label="Your recipe",
+                lines=20,
+                interactive=False
+            )
+            audio_output = gr.Audio(
+                label="🔊 Hear it",
+                type="numpy",
+                autoplay=True
+            )
+            cook_btn.click(
+                fn=generate_recipe_with_audio,
+                inputs=[character, cuisine, use_expiring, read_full_recipe],
+                outputs=[recipe_output, audio_output]
+            )
+
+    app.load(fn=get_pantry_display, outputs=[pantry_output])
 
 if __name__ == "__main__":
-    app.launch()
+    app.launch(server_name="0.0.0.0")
